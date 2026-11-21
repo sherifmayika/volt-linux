@@ -13,6 +13,11 @@ use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget};
 use tao::window::{Window, WindowBuilder, WindowId};
 use wry::{WebView, WebViewBuilder};
+#[cfg(target_os = "linux")]
+use tao::platform::unix::WindowExtUnix;
+#[cfg(target_os = "linux")]
+use wry::WebViewBuilderExtUnix;
+
 
 mod menu;
 mod preload;
@@ -29,6 +34,7 @@ struct AppState {
     hotkey_manager: Option<global_hotkey::GlobalHotKeyManager>,
     trays: HashMap<String, tray_icon::TrayIcon>,
     new_window_deny: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    clipboard: Option<arboard::Clipboard>,
 }
 
 struct WindowSlot {
@@ -70,13 +76,14 @@ fn main() -> Result<()> {
 
     let hotkey_manager = global_hotkey::GlobalHotKeyManager::new().ok();
 
-    #[cfg(target_os = "macos")]
-    {
-        let default_menu = muda::Menu::new();
-        let _ = default_menu.append(&muda::Submenu::new("", true));
-        default_menu.init_for_nsapp();
-        std::mem::forget(default_menu);
-    }
+   // Linux port: macOS-only NSApplication menu init, not needed here.
+   // #[cfg(target_os = "macos")]
+  //  {
+   //     let default_menu = muda::Menu::new();
+   //     let _ = default_menu.append(&muda::Submenu::new("", true));
+   //     default_menu.init_for_nsapp();
+   //     std::mem::forget(default_menu);
+  //  }
 
     let mut state = AppState {
         windows: HashMap::new(),
@@ -87,6 +94,7 @@ fn main() -> Result<()> {
         hotkey_manager,
         trays: HashMap::new(),
         new_window_deny: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        clipboard: None,
     };
     let _ = state.tx_to_js.send(JsEvent::Ready);
 
@@ -344,7 +352,19 @@ fn handle_command(
 
             let ipc_proxy = proxy.clone();
             let load_proxy = proxy.clone();
-            let mut wv = WebViewBuilder::new(&window)
+            //let mut wv = WebViewBuilder::new(&window)
+            
+                        #[cfg(target_os = "linux")]
+            let vbox = window
+                .default_vbox()
+                .ok_or_else(|| anyhow!("Linux: tao window has no GTK vbox"))?;
+
+            #[cfg(target_os = "linux")]
+            let builder = WebViewBuilder::new_gtk(vbox);
+            #[cfg(not(target_os = "linux"))]
+            let builder = WebViewBuilder::new(&window);
+
+            let mut wv = builder            
                 .with_devtools(true)
                 .with_initialization_script(preload::PRELOAD_JS)
                 .with_ipc_handler(move |req| {
@@ -393,8 +413,27 @@ fn handle_command(
                 (_, Some(h)) => wv.with_html(h),
                 _ => wv.with_html("<!doctype html><title>Volt</title>"),
             };
+          //  #[cfg(target_os = "linux")]
+          //  let webview = {
+          //      let vbox = window
+          //          .default_vbox()
+           //         .ok_or_else(|| anyhow!("Linux: tao window has no GTK vbox"))?;
+          //      wv.new_gtk(vbox)?
+          //  };
+          //  #[cfg(not(target_os = "linux"))]
+           
             let webview = wv.build()?;
+            
 
+            #[cfg(all(unix, not(target_os = "macos")))]
+            if let Some(menu) = state.app_menu.as_ref() {
+                use tao::platform::unix::WindowExtUnix;
+                let gtk_win = window.gtk_window();
+                let vbox = window.default_vbox();
+                menu.init_for_gtk_window(gtk_win, vbox);
+            }
+
+          
             state.windows.insert(id, WindowSlot { window, webview, tao_id });
             state.tx_to_js.send(JsEvent::Reply {
                 reply_id,
@@ -550,7 +589,12 @@ fn handle_command(
             }
             #[cfg(all(unix, not(target_os = "macos")))]
             {
-                eprintln!("[volt-core] setApplicationMenu: Linux menu bar not implemented yet");
+                use tao::platform::unix::WindowExtUnix;
+                for (_, slot) in state.windows.iter() {
+                    let gtk_win = slot.window.gtk_window();
+                    let vbox = slot.window.default_vbox();
+                    m.init_for_gtk_window(gtk_win, vbox);
+                }
             }
             state.app_menu = Some(m);
             ack(&state.tx_to_js, reply_id)?;
@@ -592,16 +636,32 @@ fn handle_command(
                     });
                 })?;
         }
+
         JsCommand::ClipboardReadText { reply_id } => {
-            let text = arboard::Clipboard::new()
-                .and_then(|mut c| c.get_text())
+            if state.clipboard.is_none() {
+                state.clipboard = arboard::Clipboard::new().ok();
+            }
+            let text = state
+                .clipboard
+                .as_mut()
+                .and_then(|c| c.get_text().ok())
                 .unwrap_or_default();
-            state.tx_to_js.send(JsEvent::Reply { reply_id, value: serde_json::Value::String(text) })?;
+            state.tx_to_js.send(JsEvent::Reply {
+                reply_id,
+                value: serde_json::Value::String(text),
+            })?;
         }
         JsCommand::ClipboardWriteText { text, reply_id } => {
-            let _ = arboard::Clipboard::new().and_then(|mut c| c.set_text(text));
+            if state.clipboard.is_none() {
+                state.clipboard = arboard::Clipboard::new().ok();
+            }
+            if let Some(c) = state.clipboard.as_mut() {
+                let _ = c.set_text(text);
+            }
             ack(&state.tx_to_js, reply_id)?;
         }
+
+
         JsCommand::GlobalShortcutRegister { id, accelerator, reply_id } => {
             let result = register_hotkey(state, &id, &accelerator);
             state.tx_to_js.send(JsEvent::Reply {
@@ -756,60 +816,79 @@ fn native_message_box(opts: &protocol::MessageBoxOptions) -> u32 {
     }
 }
 
+
+#[cfg(target_os = "linux")]
+fn open_dialog(opts: protocol::OpenDialogOptions) -> serde_json::Value {
+    let is_dir = opts.properties.iter().any(|p| p == "openDirectory");
+    let multi = opts.properties.iter().any(|p| p == "multiSelections");
+
+    let mut cmd = Command::new("zenity");
+    cmd.arg("--file-selection");
+    if is_dir { cmd.arg("--directory"); }
+    if multi { cmd.arg("--multiple").arg("--separator=\n"); }
+    if let Some(t) = &opts.title { cmd.arg(format!("--title={t}")); }
+    if let Some(p) = &opts.default_path { cmd.arg(format!("--filename={p}")); }
+    for f in &opts.filters {
+        let pats: Vec<String> = f.extensions.iter().map(|e| format!("*.{e}")).collect();
+        cmd.arg(format!("--file-filter={} | {}", f.name, pats.join(" ")));
+    }
+    match cmd.output() {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let paths: Vec<String> = stdout.trim().split('\n')
+                .filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+            serde_json::json!({ "canceled": paths.is_empty(), "filePaths": paths })
+        }
+        _ => serde_json::json!({ "canceled": true, "filePaths": [] }),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
 fn open_dialog(opts: protocol::OpenDialogOptions) -> serde_json::Value {
     let props: Vec<String> = opts.properties.clone();
     let is_dir = props.iter().any(|p| p == "openDirectory");
     let multi = props.iter().any(|p| p == "multiSelections");
 
     let mut dlg = rfd::FileDialog::new();
-    if let Some(t) = &opts.title {
-        dlg = dlg.set_title(t);
-    }
-    if let Some(p) = &opts.default_path {
-        dlg = dlg.set_directory(p);
-    }
+    if let Some(t) = &opts.title { dlg = dlg.set_title(t); }
+    if let Some(p) = &opts.default_path { dlg = dlg.set_directory(p); }
     for f in &opts.filters {
         let exts: Vec<&str> = f.extensions.iter().map(|s| s.as_str()).collect();
         dlg = dlg.add_filter(&f.name, &exts);
     }
-
     let paths: Vec<String> = match (is_dir, multi) {
-        (true, true) => dlg
-            .pick_folders()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|p| p.to_string_lossy().to_string())
-            .collect(),
-        (true, false) => dlg
-            .pick_folder()
-            .map(|p| vec![p.to_string_lossy().to_string()])
-            .unwrap_or_default(),
-        (false, true) => dlg
-            .pick_files()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|p| p.to_string_lossy().to_string())
-            .collect(),
-        (false, false) => dlg
-            .pick_file()
-            .map(|p| vec![p.to_string_lossy().to_string()])
-            .unwrap_or_default(),
+        (true, true) => dlg.pick_folders().unwrap_or_default().into_iter().map(|p| p.to_string_lossy().to_string()).collect(),
+        (true, false) => dlg.pick_folder().map(|p| vec![p.to_string_lossy().to_string()]).unwrap_or_default(),
+        (false, true) => dlg.pick_files().unwrap_or_default().into_iter().map(|p| p.to_string_lossy().to_string()).collect(),
+        (false, false) => dlg.pick_file().map(|p| vec![p.to_string_lossy().to_string()]).unwrap_or_default(),
     };
-
-    serde_json::json!({
-        "canceled": paths.is_empty(),
-        "filePaths": paths,
-    })
+    serde_json::json!({ "canceled": paths.is_empty(), "filePaths": paths })
 }
 
+#[cfg(target_os = "linux")]
+fn save_dialog(opts: protocol::SaveDialogOptions) -> serde_json::Value {
+    let mut cmd = Command::new("zenity");
+    cmd.arg("--file-selection").arg("--save");
+    if let Some(t) = &opts.title { cmd.arg(format!("--title={t}")); }
+    if let Some(p) = &opts.default_path { cmd.arg(format!("--filename={p}")); }
+    for f in &opts.filters {
+        let pats: Vec<String> = f.extensions.iter().map(|e| format!("*.{e}")).collect();
+        cmd.arg(format!("--file-filter={} | {}", f.name, pats.join(" ")));
+    }
+    match cmd.output() {
+        Ok(out) if out.status.success() => {
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            serde_json::json!({ "canceled": path.is_empty(), "filePath": path })
+        }
+        _ => serde_json::json!({ "canceled": true }),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
 fn save_dialog(opts: protocol::SaveDialogOptions) -> serde_json::Value {
     let mut dlg = rfd::FileDialog::new();
-    if let Some(t) = &opts.title {
-        dlg = dlg.set_title(t);
-    }
-    if let Some(p) = &opts.default_path {
-        dlg = dlg.set_file_name(p);
-    }
+    if let Some(t) = &opts.title { dlg = dlg.set_title(t); }
+    if let Some(p) = &opts.default_path { dlg = dlg.set_file_name(p); }
     for f in &opts.filters {
         let exts: Vec<&str> = f.extensions.iter().map(|s| s.as_str()).collect();
         dlg = dlg.add_filter(&f.name, &exts);
@@ -819,6 +898,10 @@ fn save_dialog(opts: protocol::SaveDialogOptions) -> serde_json::Value {
         None => serde_json::json!({ "canceled": true }),
     }
 }
+
+
+
+
 
 fn monitor_to_display(m: tao::monitor::MonitorHandle) -> serde_json::Value {
     let scale = m.scale_factor();
